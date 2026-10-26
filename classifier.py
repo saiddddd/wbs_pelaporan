@@ -28,6 +28,10 @@ ADDED = ["kategori_laporan", "ringkasan_masalah", "bukti_kategori", "perlu_tinja
          "status_kategorisasi", "baris_sumber", "jumlah_kategori"]
 
 
+class GroqOutputError(RuntimeError):
+    """Model output failed validation; retry a smaller batch, not a quota wait."""
+
+
 def api_key() -> str:
     key = os.environ.get("GROQ_API_KEY", "").strip()
     if not key:
@@ -120,24 +124,40 @@ class GroqClassifier:
                          {"role": "user", "content": json.dumps(records, ensure_ascii=False)}],
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "kategori_laporan", "strict": True, "schema": output_schema()}}}
-        req = Request("https://api.groq.com/openai/v1/chat/completions", data=json.dumps(payload).encode(),
-                      headers={"Authorization": "Bearer " + api_key(), "Content-Type": "application/json", "User-Agent": "WBSClassifier/1.0"})
+        headers = {"Authorization": "Bearer " + api_key(), "Content-Type": "application/json", "User-Agent": "WBSClassifier/1.0"}
         for attempt in range(5):
+            req = Request("https://api.groq.com/openai/v1/chat/completions", data=json.dumps(payload).encode(), headers=headers)
             try:
                 with urlopen(req, timeout=90) as response:
                     result = json.load(response)
                 if result["choices"][0].get("finish_reason") != "stop":
-                    raise RuntimeError("Respons model belum lengkap; coba batch lebih kecil.")
+                    raise GroqOutputError("Respons model belum lengkap; batch akan diperkecil.")
                 self.tokens += result.get("usage", {}).get("total_tokens", 0)
                 self.calls += 1
-                return json.loads(result["choices"][0]["message"]["content"])
+                try:
+                    return json.loads(result["choices"][0]["message"]["content"])
+                except (json.JSONDecodeError, TypeError):
+                    raise GroqOutputError("Respons model bukan JSON yang valid.") from None
             except HTTPError as exc:
                 if exc.code in (401, 403):
                     raise RuntimeError("Groq menolak kredensial/akses model. Periksa konfigurasi server.") from None
                 if exc.code not in (429, 500, 502, 503, 504):
                     # Only return a bounded server error, never request headers/key.
-                    body = json.loads(exc.read().decode(errors="replace"))
+                    try:
+                        body = json.loads(exc.read().decode(errors="replace"))
+                    except json.JSONDecodeError:
+                        body = {}
                     message = body.get("error", {}).get("message", "Permintaan ditolak")
+                    code = body.get("error", {}).get("code", "")
+                    if exc.code == 400 and (code == "json_validate_failed" or "failed to validate json" in message.lower()):
+                        # First split large batches. For a singleton, try JSON object mode once;
+                        # local schema/category/evidence validation still applies before caching.
+                        if len(records) == 1 and payload['response_format']['type'] == 'json_schema' and attempt < 4:
+                            payload['response_format'] = {"type": "json_object"}
+                            payload['messages'].append({"role": "system", "content":
+                                "Kembalikan hanya JSON sesuai skema berikut, tanpa Markdown: " + json.dumps(output_schema())})
+                            continue
+                        raise GroqOutputError("Groq gagal memvalidasi JSON; mencoba batch lebih kecil.") from None
                     raise RuntimeError(f"Groq HTTP {exc.code}: {message[:300]}") from None
                 if attempt == 4:
                     raise RuntimeError(f"Groq HTTP {exc.code}: batas penggunaan/server sibuk. Hasil sebelumnya tersimpan; lanjutkan nanti.") from None
@@ -174,10 +194,11 @@ class GroqClassifier:
                 on_progress(done, len(results))
         report_progress()
         start = 0
+        active_batch_size = batch_size
         while start < len(pending):
             batch = []
             chars = 0
-            for text in pending[start:start + batch_size]:
+            for text in pending[start:start + active_batch_size]:
                 length = len(redact(text))
                 if batch and chars + length > max_batch_chars:
                     break
@@ -187,16 +208,22 @@ class GroqClassifier:
             records = [{"id": j, "detail": redact(text)} for j, text in enumerate(batch)]
             try:
                 response = self.request(records, on_wait=on_wait)
+                if not isinstance(response, dict):
+                    raise ValueError("Respons bukan objek JSON.")
                 entries = response.get("hasil", [])
+                if not isinstance(entries, list) or any(not isinstance(e, dict) or type(e.get('id')) is not int for e in entries):
+                    raise ValueError("Struktur/ID respons tidak valid.")
                 if len(entries) != len(batch) or {e["id"] for e in entries} != set(range(len(batch))):
                     raise ValueError("Jumlah/ID respons tidak sesuai batch.")
                 validated = {}
                 for entry in entries:
                     text = records[entry["id"]]["detail"]
                     issues = entry["masalah"]
-                    if not issues: raise ValueError("Laporan nonkosong tanpa kategori.")
+                    if not isinstance(issues, list) or not issues: raise ValueError("Laporan nonkosong tanpa kategori.")
                     names = set()
                     for issue in issues:
+                        if not isinstance(issue, dict) or any(not isinstance(issue.get(k), str) for k in ('kategori', 'ringkasan', 'bukti')) or type(issue.get('perlu_tinjauan')) is not bool:
+                            raise ValueError("Struktur kategori tidak valid.")
                         cat = CODES.get(issue["kategori"], issue["kategori"])
                         issue["kategori"] = cat
                         if cat not in TAXONOMY or cat in names: raise ValueError("Kategori tidak valid/duplikat.")
@@ -221,6 +248,16 @@ class GroqClassifier:
                     self.save(text, validated[j])
                     for i in missing[text]: results[i] = {"status": "Berhasil", "masalah": validated[j]}
             except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+                if isinstance(exc, (GroqOutputError, ValueError, KeyError, TypeError)):
+                    if len(batch) > 1:
+                        active_batch_size = max(1, len(batch) // 2)
+                        continue
+                    # Isolate a bad report without dropping other reports or caching a failure.
+                    for i in missing[batch[0]]:
+                        results[i] = {"status": "Gagal", "masalah": [], "error": str(exc)}
+                    start += 1
+                    report_progress()
+                    continue
                 for text in batch:
                     for i in missing[text]: results[i] = {"status": "Gagal", "masalah": [], "error": str(exc)}
                 # Stop after failed batch; do not flood exhausted quotas or label unknown as success.
