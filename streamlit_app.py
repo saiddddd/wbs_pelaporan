@@ -8,15 +8,22 @@ import streamlit as st
 from classifier import ROOT, PROMPT_VERSION, GroqClassifier, categorize, public_output, read_input
 from exporter import excel_bytes
 
-st.set_page_config(page_title="Kategori laporan", page_icon=":material/category:", layout="wide")
-st.title("Kategori laporan")
-st.caption("Unggah Excel. Hasilnya berisi seluruh kolom asli ditambah kategori_pelaporan. Laporan dengan beberapa kategori menjadi beberapa baris.")
+st.set_page_config(page_title="Analisis laporan WBS | Agrinas", page_icon=":material/analytics:", layout="wide")
+logo = ROOT / "assets/logo_agrinas.png"
+if logo.exists():
+    st.image(str(logo), width=260, alt="Logo Agrinas Pangan Nusantara")
+st.title("Analisis laporan WBS")
+st.caption("Kategorisasi laporan untuk membantu pemetaan masalah dan tindak lanjut.")
+st.divider()
 
 @st.cache_data(ttl=900, max_entries=8, show_spinner=False)
 def load_source(data):
     return read_input(data)
 
-upload = st.file_uploader("File laporan Excel", type=["xlsx"])
+st.subheader("File laporan")
+upload = st.file_uploader("Unggah file Excel", type=["xlsx"],
+                          help="Gunakan file yang memiliki kolom Detail Laporan.")
+st.caption("Hasil unduhan mempertahankan kolom asli dan menambahkan kategori_pelaporan. Setiap kategori dari laporan yang sama ditampilkan pada baris terpisah.")
 default = ROOT / "laporan-wbs-20261026-084953.xlsx"
 if upload is not None:
     data, filename = upload.getvalue(), upload.name
@@ -40,6 +47,7 @@ fingerprint = hashlib.sha256(data).hexdigest()
 key = fingerprint + PROMPT_VERSION
 st.session_state.setdefault("hasil", {})
 st.session_state.setdefault("excel", {})
+st.session_state.setdefault("ringkasan", {})
 
 # Reuse completed local processing for the same source file; never mix uploads.
 saved = ROOT / "hasil/laporan_wbs_kategori.json"
@@ -50,6 +58,7 @@ if key not in st.session_state.hasil and saved.exists() and meta_path.exists():
         raw = pd.DataFrame(json.loads(saved.read_text(encoding="utf-8")))
         if raw['status_kategorisasi'].eq('Berhasil').all():
             st.session_state.hasil[key] = public_output(raw, list(frame.columns))
+            st.session_state.ringkasan[key] = int((raw.drop_duplicates('baris_sumber')['jumlah_kategori'] > 1).sum())
 
 if st.button("Buat kategori", type="primary", icon=":material/category:"):
     progress = st.progress(0, text="Memproses laporan…")
@@ -67,6 +76,7 @@ if st.button("Buat kategori", type="primary", icon=":material/category:"):
                 st.caption(errors[0]['error'])
         else:
             st.session_state.hasil[key] = public_output(raw, list(frame.columns))
+            st.session_state.ringkasan[key] = int((raw.drop_duplicates('baris_sumber')['jumlah_kategori'] > 1).sum())
             st.session_state.excel.pop(key, None)
     except Exception as exc:
         st.error(str(exc))
@@ -74,6 +84,21 @@ if st.button("Buat kategori", type="primary", icon=":material/category:"):
 if key in st.session_state.hasil:
     result = st.session_state.hasil[key]
     st.success(f"Selesai: {len(frame)} laporan menjadi {len(result)} baris.")
+    categories = result['kategori_pelaporan'].fillna('').astype(str).str.strip()
+    counts = categories[categories.ne('')].value_counts().rename_axis('Kategori').reset_index(name='Jumlah laporan')
+    st.subheader("Ringkasan laporan")
+    with st.container(horizontal=True):
+        st.metric("Laporan asal", len(frame), border=True)
+        st.metric("Baris hasil", len(result), border=True)
+        st.metric("Jenis kategori", len(counts), border=True)
+        if key in st.session_state.ringkasan:
+            st.metric("Laporan multikategori", st.session_state.ringkasan[key], border=True)
+    if not counts.empty:
+        st.bar_chart(counts.head(10), x='Kategori', y='Jumlah laporan', horizontal=True,
+                     sort='-Jumlah laporan', alt="Sepuluh kategori dengan jumlah laporan terbanyak")
+        st.dataframe(counts, hide_index=True, alt="Jumlah laporan untuk setiap kategori")
+        st.caption("Satu laporan dapat masuk beberapa kategori. Jumlah kategori tidak sama dengan jumlah laporan asal.")
+    st.subheader("Hasil kategorisasi")
     st.dataframe(result, hide_index=True, height=500, alt="Kolom laporan asli ditambah kategori_pelaporan")
     if key not in st.session_state.excel:
         try:
