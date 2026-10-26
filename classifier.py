@@ -152,7 +152,10 @@ class GroqClassifier:
                 time.sleep(2 * (attempt + 1))
         raise RuntimeError("Groq belum memberikan respons.")
 
-    def classify(self, texts: list[str], batch_size: int = 10, on_progress=None, on_wait=None) -> list[dict]:
+    def classify(self, texts: list[str], batch_size: int = 10, on_progress=None, on_wait=None,
+                 max_batch_chars: int = 6000) -> list[dict]:
+        if batch_size < 1 or max_batch_chars < 1:
+            raise ValueError("Batas jumlah laporan dan panjang batch harus lebih dari nol.")
         results = [None] * len(texts)
         missing = {}
         for i, text in enumerate(texts):
@@ -165,8 +168,22 @@ class GroqClassifier:
             else:
                 missing.setdefault(text, []).append(i)
         pending = list(missing)
-        for start in range(0, len(pending), batch_size):
-            batch = pending[start:start + batch_size]
+        def report_progress():
+            if on_progress:
+                done = sum(r is not None and r['status'] in ('Berhasil', 'Kosong') for r in results)
+                on_progress(done, len(results))
+        report_progress()
+        start = 0
+        while start < len(pending):
+            batch = []
+            chars = 0
+            for text in pending[start:start + batch_size]:
+                length = len(redact(text))
+                if batch and chars + length > max_batch_chars:
+                    break
+                # Keep an oversized single report intact; send it in its own batch.
+                batch.append(text)
+                chars += length
             records = [{"id": j, "detail": redact(text)} for j, text in enumerate(batch)]
             try:
                 response = self.request(records, on_wait=on_wait)
@@ -207,11 +224,12 @@ class GroqClassifier:
                 for text in batch:
                     for i in missing[text]: results[i] = {"status": "Gagal", "masalah": [], "error": str(exc)}
                 # Stop after failed batch; do not flood exhausted quotas or label unknown as success.
-                for text in pending[start + batch_size:]:
+                for text in pending[start + len(batch):]:
                     for i in missing[text]: results[i] = {"status": "Belum diproses", "masalah": []}
-                if on_progress: on_progress(sum(r is not None for r in results), len(results))
+                report_progress()
                 break
-            if on_progress: on_progress(sum(r is not None for r in results), len(results))
+            start += len(batch)
+            report_progress()
         return results
 
 
