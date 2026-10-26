@@ -1,0 +1,8 @@
+.streamlit/secrets.toml
+.cache/
+hasil/
+__pycache__/
+.runtime/
+*.log
+~$*
+node_modules/
