@@ -1,8 +1,8 @@
 [theme]
-primaryColor = "#167368"
+primaryColor = "#116C3D"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F2F6F5"
-textColor = "#193834"
+secondaryBackgroundColor = "#F3F7F3"
+textColor = "#172B20"
 
 [server]
 address = "127.0.0.1"
